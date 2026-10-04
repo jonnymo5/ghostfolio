@@ -1,0 +1,129 @@
+# Build the Ghostfolio image from this fork and push it to GHCR for the Unraid
+# host (wolverine, x86_64).
+#
+# This is a fork-only workflow; upstream's docker-image workflow (multi-arch,
+# Docker Hub) and extract-locales workflow are disabled here. It is a separate
+# file (not an edit to upstream's) so syncing upstream never conflicts with it.
+#
+# Built for linux/amd64 only — a local `docker build` on the Apple Silicon Mac
+# would produce an arm64 image Unraid can't run, which is why the build lives here.
+#
+# Pushed tags:
+#   ghcr.io/<owner>/ghostfolio:latest      — tracks main (Watchtower on
+#                                            wolverine deploys it automatically)
+#   ghcr.io/<owner>/ghostfolio:sha-<hash>  — immutable, for rollback
+#
+# See deploy/unraid/README.md for the Unraid side.
+name: unraid-image
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**/*.md'
+  workflow_dispatch:
+
+concurrency:
+  group: unraid-image
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build-and-push:
+    name: Build and push image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@030e881283bb7a6894de51c315a6bfe6a94e05cf # v6.0.0
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/ghostfolio
+          tags: |
+            type=raw,value=latest
+            type=sha,prefix=sha-
+
+      # The Dockerfile runs npm ci and the production build itself.
+      - name: Build image for testing
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: ghostfolio-testing
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # The entrypoint runs the database migrations and seed before starting
+      # the server, and /api/v1/health checks Postgres and Redis, so a healthy
+      # response means the image works against an empty database.
+      - name: Test that the image boots
+        timeout-minutes: 5
+        run: |
+          docker network create ghostfolio-test
+          docker run --detach --name postgres --network ghostfolio-test \
+            --env POSTGRES_DB=ghostfolio --env POSTGRES_USER=ghostfolio \
+            --env POSTGRES_PASSWORD=test \
+            postgres:15.19-alpine@sha256:f7d23353e1b15400d22ebe31189f4d314b87a4c129cc400c8c2d8d4ca127bf81
+          docker run --detach --name redis --network ghostfolio-test \
+            redis:8.10.2-alpine@sha256:3811787313eba226a2ef38658c6ccb91cd5e110edc89c37767de373120a0e5a0 \
+            redis-server --requirepass test
+          until docker exec postgres pg_isready -d ghostfolio -U ghostfolio; do sleep 2; done
+          docker run --detach --name ghostfolio --network ghostfolio-test \
+            --env ACCESS_TOKEN_SALT=test \
+            --env DATABASE_URL='postgresql://ghostfolio:test@postgres:5432/ghostfolio?connect_timeout=300' \
+            --env JWT_SECRET_KEY=test \
+            --env REDIS_HOST=redis \
+            --env REDIS_PASSWORD=test \
+            ghostfolio-testing
+          until docker exec ghostfolio curl -fsS http://localhost:3333/api/v1/health; do
+            if [ "$(docker inspect -f '{{.State.Running}}' ghostfolio)" != "true" ]; then
+              echo "ghostfolio container exited"
+              exit 1
+            fi
+            sleep 5
+          done
+
+      - name: Dump container logs on failure
+        if: failure()
+        run: docker logs ghostfolio || true
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Reuses the layers from the test build above; nothing is rebuilt.
+      - name: Build and push image
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+
+      - name: Summary
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          {
+            echo "### Pushed image"
+            echo '```'
+            echo "$TAGS"
+            echo '```'
+            echo "Watchtower on wolverine picks up \`:latest\` on its next poll."
+          } >> "$GITHUB_STEP_SUMMARY"
