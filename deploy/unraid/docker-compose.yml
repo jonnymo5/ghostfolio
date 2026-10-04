@@ -1,0 +1,157 @@
+# Ghostfolio — Unraid deployment (host: wolverine), via Compose Manager.
+#
+# Four containers on the stack's private network:
+#   tailscale   joins the tailnet as "ghostfolio" and serves
+#               https://ghostfolio.<tailnet>.ts.net with a real certificate,
+#               proxying to http://ghostfolio:3333 by container name
+#   ghostfolio  the API + web app, built from this fork by
+#               .github/workflows/unraid-image.yml
+#   postgres    the database
+#   redis       cache and job queue (no persistence needed)
+#
+# No ports are published on the LAN; every device uses the tailnet URL, which
+# works at home and away.
+#
+# Updates: Watchtower (its own stack, from the jonnymo5/watchtower fork) only
+# touches containers labelled com.centurylinklabs.watchtower.enable=true.
+# Only ghostfolio is labelled. tailscale, postgres and redis are pinned by
+# version + digest and updated by hand — an automatic Postgres major upgrade
+# would leave the data directory unreadable.
+#
+# Storage: Postgres data is bind-mounted under /mnt/maincache/appdata — the
+# DIRECT cache-disk path, deliberately NOT /mnt/user/appdata, whose FUSE layer
+# (shfs) doesn't mix well with database files.
+#
+# Secrets: put them in a .env file next to this compose file on wolverine
+# (never commit it). Required variables are listed in README.md; Compose Up
+# fails with a message naming any that are missing.
+#
+# Requires Docker Compose v2.23+ (inline `configs.content`).
+
+services:
+  tailscale:
+    image: tailscale/tailscale:v1.102.5@sha256:c507f3a2a6ab1cabd8d809b98edeb41edbd5c3fb6ad9632ffd098b4c7d0b4065
+    container_name: ghostfolio-tailscale
+    hostname: ghostfolio # tailnet machine name -> https://ghostfolio.<tailnet>.ts.net
+    environment:
+      # Only needed for the first login; after that the login is kept in
+      # TS_STATE_DIR, so the key can be removed from .env.
+      - TS_AUTHKEY=${TS_AUTHKEY:-}
+      - TS_STATE_DIR=/var/lib/tailscale
+      - TS_SERVE_CONFIG=/config/serve.json
+    volumes:
+      - /mnt/maincache/appdata/ghostfolio/tailscale:/var/lib/tailscale
+    configs:
+      - source: ts-serve
+        target: /config/serve.json
+    depends_on:
+      - ghostfolio
+    labels:
+      - com.centurylinklabs.watchtower.enable=false
+    restart: unless-stopped
+
+  ghostfolio:
+    image: ghcr.io/jonnymo5/ghostfolio:latest
+    container_name: ghostfolio
+    init: true
+    stop_grace_period: 1m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    # No `ports:` — only reachable from this stack's network (i.e. tailscale).
+    environment:
+      - ACCESS_TOKEN_SALT=${ACCESS_TOKEN_SALT:?set ACCESS_TOKEN_SALT in .env}
+      - DATABASE_URL=postgresql://ghostfolio:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@postgres:5432/ghostfolio?connect_timeout=300
+      - JWT_SECRET_KEY=${JWT_SECRET_KEY:?set JWT_SECRET_KEY in .env}
+      - REDIS_HOST=redis
+      - REDIS_PASSWORD=${REDIS_PASSWORD:?set REDIS_PASSWORD in .env}
+      # Used in the web app manifest, e.g. when installing it on a phone.
+      - ROOT_URL=${ROOT_URL:?set ROOT_URL in .env, e.g. https://ghostfolio.<tailnet>.ts.net}
+      - TZ=America/Chicago
+      # More options (data provider API keys etc.):
+      # https://github.com/ghostfolio/ghostfolio#supported-environment-variables
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    labels:
+      - com.centurylinklabs.watchtower.enable=true
+    healthcheck:
+      test: ['CMD-SHELL', 'curl -f http://localhost:3333/api/v1/health']
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 2m
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:15.19-alpine@sha256:f7d23353e1b15400d22ebe31189f4d314b87a4c129cc400c8c2d8d4ca127bf81
+    container_name: ghostfolio-postgres
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_READ_SEARCH
+      - FOWNER
+      - SETGID
+      - SETUID
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      - POSTGRES_DB=ghostfolio
+      - POSTGRES_USER=ghostfolio
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+    volumes:
+      - /mnt/maincache/appdata/ghostfolio/postgres:/var/lib/postgresql/data
+    labels:
+      - com.centurylinklabs.watchtower.enable=false
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -d ghostfolio -U ghostfolio']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  redis:
+    image: redis:8.10.2-alpine@sha256:3811787313eba226a2ef38658c6ccb91cd5e110edc89c37767de373120a0e5a0
+    container_name: ghostfolio-redis
+    user: '999:1000'
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      - REDIS_PASSWORD=${REDIS_PASSWORD:?set REDIS_PASSWORD in .env}
+    command:
+      - /bin/sh
+      - -c
+      - redis-server --requirepass "$${REDIS_PASSWORD}"
+    labels:
+      - com.centurylinklabs.watchtower.enable=false
+    healthcheck:
+      test:
+        [
+          'CMD-SHELL',
+          'redis-cli --no-auth-warning --pass "$${REDIS_PASSWORD}" ping | grep PONG'
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+configs:
+  # tailscale serve: HTTPS on :443 -> ghostfolio:3333, tailnet only.
+  # `$$` escapes compose interpolation; containerboot fills in TS_CERT_DOMAIN.
+  ts-serve:
+    content: |
+      {
+        "TCP": { "443": { "HTTPS": true } },
+        "Web": {
+          "$${TS_CERT_DOMAIN}:443": {
+            "Handlers": { "/": { "Proxy": "http://ghostfolio:3333" } }
+          }
+        },
+        "AllowFunnel": { "$${TS_CERT_DOMAIN}:443": false }
+      }
