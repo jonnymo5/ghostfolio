@@ -21,6 +21,7 @@ on:
     branches: [main]
     paths-ignore:
       - '**/*.md'
+      - deploy/**
   workflow_dispatch:
 
 concurrency:

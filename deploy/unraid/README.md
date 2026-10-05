@@ -11,7 +11,8 @@ push to main (jonnymo5/ghostfolio)
         ghcr.io/jonnymo5/ghostfolio:latest + :sha-<hash>
           └─► Watchtower on wolverine (ghcr.io/jonnymo5/watchtower, built from
               the jonnymo5/watchtower fork) notices the new :latest digest
-              within 5 min, pulls it, and recreates the ghostfolio container
+              within 5 min, pulls it, and recreates the ghostfolio-server
+              container
 ```
 
 Never build the image locally on the Mac for wolverine — Apple Silicon
@@ -38,8 +39,11 @@ with a real Let's Encrypt certificate, so it works over HTTPS at home and away
 without exposing anything to the internet or the LAN. Every device that uses
 it (Mac, phone) needs the Tailscale app, signed in to the same tailnet.
 
-The sidecar reaches Ghostfolio by container name (`http://ghostfolio:3333`)
-over the stack's private Docker network; ghostfolio publishes no ports.
+The sidecar reaches Ghostfolio by container name
+(`http://ghostfolio-server:3333`) over the stack's private Docker network;
+ghostfolio-server publishes no ports. The app container must not be named
+`ghostfolio`: that is the sidecar's own hostname, so the proxy would reach the
+sidecar itself and return 502.
 
 ## One-time setup
 
@@ -137,7 +141,7 @@ generate a new auth key, put it back in `.env`, and Compose Up.
   GHCR package page) — and Compose Up. Watchtower leaves pinned tags alone
   until you switch back to `:latest`. If the newer version had already
   migrated the database, restore the backup taken before it.
-- **Pause auto-updates**: set the ghostfolio label to
+- **Pause auto-updates**: set the ghostfolio-server label to
   `com.centurylinklabs.watchtower.enable=false` and Compose Up.
 - **Update Tailscale or Redis**: pinned by version and digest and never
   auto-updated. Bump the tag + digest in the compose file, then Compose Up.

@@ -1,22 +1,27 @@
 # Ghostfolio — Unraid deployment (host: wolverine), via Compose Manager.
 #
 # Four containers on the stack's private network:
-#   tailscale   joins the tailnet as "ghostfolio" and serves
-#               https://ghostfolio.<tailnet>.ts.net with a real certificate,
-#               proxying to http://ghostfolio:3333 by container name
-#   ghostfolio  the API + web app, built from this fork by
-#               .github/workflows/unraid-image.yml
-#   postgres    the database
-#   redis       cache and job queue (no persistence needed)
+#   tailscale          joins the tailnet as "ghostfolio" and serves
+#                      https://ghostfolio.<tailnet>.ts.net with a real
+#                      certificate, proxying to http://ghostfolio-server:3333
+#                      by container name
+#   ghostfolio-server  the API + web app, built from this fork by
+#                      .github/workflows/unraid-image.yml
+#   postgres           the database
+#   redis              cache and job queue (no persistence needed)
+#
+# The app must not be named "ghostfolio": that is the tailscale container's
+# hostname, so inside the sidecar "ghostfolio" resolves to the sidecar itself
+# and the proxy would return 502.
 #
 # No ports are published on the LAN; every device uses the tailnet URL, which
 # works at home and away.
 #
 # Updates: Watchtower (its own stack, from the jonnymo5/watchtower fork) only
 # touches containers labelled com.centurylinklabs.watchtower.enable=true.
-# Only ghostfolio is labelled. tailscale, postgres and redis are pinned by
-# version + digest and updated by hand — an automatic Postgres major upgrade
-# would leave the data directory unreadable.
+# Only ghostfolio-server is labelled. tailscale, postgres and redis are pinned
+# by version + digest and updated by hand — an automatic Postgres major
+# upgrade would leave the data directory unreadable.
 #
 # Storage: Postgres data is bind-mounted under /mnt/maincache/appdata — the
 # DIRECT cache-disk path, deliberately NOT /mnt/user/appdata, whose FUSE layer
@@ -45,14 +50,14 @@ services:
       - source: ts-serve
         target: /config/serve.json
     depends_on:
-      - ghostfolio
+      - ghostfolio-server
     labels:
       - com.centurylinklabs.watchtower.enable=false
     restart: unless-stopped
 
-  ghostfolio:
+  ghostfolio-server:
     image: ghcr.io/jonnymo5/ghostfolio:latest
-    container_name: ghostfolio
+    container_name: ghostfolio-server
     init: true
     stop_grace_period: 1m
     cap_drop:
@@ -142,7 +147,7 @@ services:
     restart: unless-stopped
 
 configs:
-  # tailscale serve: HTTPS on :443 -> ghostfolio:3333, tailnet only.
+  # tailscale serve: HTTPS on :443 -> ghostfolio-server:3333, tailnet only.
   # `$$` escapes compose interpolation; containerboot fills in TS_CERT_DOMAIN.
   ts-serve:
     content: |
@@ -150,7 +155,7 @@ configs:
         "TCP": { "443": { "HTTPS": true } },
         "Web": {
           "$${TS_CERT_DOMAIN}:443": {
-            "Handlers": { "/": { "Proxy": "http://ghostfolio:3333" } }
+            "Handlers": { "/": { "Proxy": "http://ghostfolio-server:3333" } }
           }
         },
         "AllowFunnel": { "$${TS_CERT_DOMAIN}:443": false }
